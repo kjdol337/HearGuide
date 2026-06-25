@@ -452,7 +452,7 @@ def update_everlearning():
 
 def update_library_loans():
     """기능 3: 로컬 엑셀 → mapo_library_loans 테이블 갱신"""
-    path = r"\mapo_library_data_CLEANED_FINAL_CONDITIONAL.xlsx"
+    path = "mapo_library_data_CLEANED_FINAL_CONDITIONAL.xlsx"
     if not os.path.exists(path):
         print(f"[서가위치] 파일 없음: {path}")
         return
