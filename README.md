@@ -31,7 +31,7 @@ Database: MySQL
 
 Data Analysis: Pandas, NumPy, Openpyxl
 
-### 시작하기 (How to Run)
+## 시작하기 (How to Run)
 1. 필수 라이브러리 설치
 이 프로젝트는 Python 3.9+ 환경에서 최적화되었습니다. 아래 명령어를 통해 필요한 라이브러리를 설치하세요.
 ```bash
