@@ -34,16 +34,20 @@ Data Analysis: Pandas, NumPy, Openpyxl
 ## 시작하기 (How to Run)
 1. 필수 라이브러리 설치
 이 프로젝트는 Python 3.9+ 환경에서 최적화되었습니다. 아래 명령어를 통해 필요한 라이브러리를 설치하세요.
+
 ```bash
 pip install streamlit streamlit-autorefresh pandas numpy sounddevice torch wavio requests gTTS transformers sqlalchemy pymysql google-generativeai selenium openpyxl
 ```
+
 
 2. 데이터 파일 준비
 mapo_library_data_CLEANED_FINAL_CONDITIONAL.xlsx 파일을 프로젝트 루트 폴더에 다운로드합니다.
 코드 내 update_library_loans() 함수에서 파일 경로를 확인하세요.
 
+
 4. API 키 및 DB 설정
 보안을 위해 실제 키 값은 코드에 직접 입력하지 않고 secrets.toml 파일로 관리하는 것을 권장합니다. 프로젝트 폴더 내에 .streamlit/secrets.toml 파일을 생성하세요.
+
 ```bash
 # .streamlit/secrets.toml
 DB_URL = "mysql+pymysql://사용자ID:비밀번호@127.0.0.1:3306/lecture_db?charset=utf8mb4"
@@ -52,8 +56,10 @@ GEMINI_KEY_CRAWL = "구글_AI_스튜디오_키_1"
 GEMINI_QUERY_KEYS = ["키1", "키2"]
 ```
 
+
 4. 실행
 터미널에서 아래 명령어를 입력하여 시스템을 구동합니다.
+
 ```bash
 streamlit run app.py
 ```
