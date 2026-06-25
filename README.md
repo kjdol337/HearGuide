@@ -3,11 +3,11 @@
 
 HearGuide는 음성 인식(STT)과 LLM(Gemini)의 Text-to-SQL 기술을 결합하여, 어르신과 어린이 같은 디지털 취약계층이 자연어 발화만으로 도서 추천, 서가 위치, 강연 정보를 쉽게 얻을 수 있도록 돕는 스마트 도서관 어시스턴트입니다.
 
-핵심 기능 (Key Features)
+
+## 핵심 기능 (Key Features)
 다차원 복합 필터링 도서 추천
 
 사용자의 연령, 성별, 관심 주제를 AI가 분석하여 실제 대출 통계 기반 인기도서를 추천합니다.
-
 예: "초등학생 남자애가 좋아할 만한 과학 책 알려줘"
 
 자연어 기반 서가 위치 안내
@@ -36,3 +36,5 @@ Data Analysis: Pandas, NumPy, Openpyxl
 시작하기 (How to Run)
 1. 필수 라이브러리 설치
 이 프로젝트는 Python 3.9+ 환경에서 최적화되었습니다. 아래 명령어를 통해 필요한 라이브러리를 설치하세요.
+
+pip install streamlit streamlit-autorefresh pandas numpy sounddevice torch wavio requests gTTS transformers sqlalchemy pymysql google-generativeai selenium openpyxl
