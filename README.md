@@ -37,6 +37,7 @@ Data Analysis: Pandas, NumPy, Openpyxl
 
 ```bash
 pip install streamlit streamlit-autorefresh pandas numpy sounddevice torch wavio requests gTTS transformers sqlalchemy pymysql google-generativeai selenium openpyxl
+```
 
 2. 데이터 파일 준비
 mapo_library_data_CLEANED_FINAL_CONDITIONAL.xlsx 파일을 프로젝트 루트 폴더에 다운로드합니다.
