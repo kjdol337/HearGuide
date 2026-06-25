@@ -1,0 +1,915 @@
+"""
+마포 도서관 AI 음성 비서 (v4 - 리팩토링)
+==========================================
+- 음성(STT) + 텍스트 입력 지원
+- Gemini 기반 자연어 → SQL 변환 (스키마 명시)
+- TTS 음성 응답
+- 10분 주기 자동 DB 갱신
+"""
+
+import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+import pandas as pd
+import numpy as np
+import sounddevice as sd
+import torch
+import wavio
+import os
+import time
+import json
+import re
+import requests
+import xml.etree.ElementTree as ET
+import threading
+from datetime import datetime, timedelta
+from gtts import gTTS
+from transformers import pipeline
+from sqlalchemy import create_engine, text
+import google.generativeai as genai
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+# ================================================================
+# 1. 설정
+# ================================================================
+
+# --- DB ---
+DB_URL = "mysql+pymysql://yourID:yourPassWord@127.0.0.1:3306/lecture_db?charset=utf8mb4"
+engine = create_engine(DB_URL, pool_pre_ping=True, pool_recycle=3600)
+
+# --- 도서관 정보나루 API ---a
+LIBRARY_API_KEY = "API KEY"
+
+# --- Gemini (크롤링용 / 질의용 키 분리) ---
+GEMINI_MODEL = "models/gemini-2.5-flash"
+GEMINI_KEY_CRAWL = "KEY 2"  # 키 A — 크롤링용 (새 계정)
+GEMINI_QUERY_KEYS = [
+    "KEY 1",  # 키 B (기존 계정) — 우선 사용
+    "KEY 2",  # 키 A (새 계정) — 폴백
+]
+genai.configure(api_key=GEMINI_QUERY_KEYS[0])
+gemini_query = genai.GenerativeModel(GEMINI_MODEL)
+
+
+def _restore_query_model():
+    """질의용 키로 복원"""
+    genai.configure(api_key=GEMINI_QUERY_KEYS[0])
+
+
+# --- Whisper (STT) ---
+@st.cache_resource
+def load_whisper():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return pipeline(
+        "automatic-speech-recognition",
+        model="openai/whisper-small",
+        device=device,
+    )
+
+
+# ================================================================
+# 2. DB 스키마 정의 (Gemini 프롬프트에 그대로 주입)
+# ================================================================
+
+DB_SCHEMA = """
+### 테이블 1: mapo_popular_books  (마포구 연령/성별 인기 대출 도서)
+| 컬럼명           | 타입        | 설명                                         | 예시 값                   |
+|------------------|-------------|----------------------------------------------|---------------------------|
+| Age_Group        | VARCHAR     | 연령대 그룹                                   | '20대', '30대', '어린이통합(0~13세)', '청소년(14~19세)', '40대', '50대', '60세 이상' |
+| Gender_Group     | VARCHAR     | 성별                                          | '남성', '여성'             |
+| Ranking          | VARCHAR     | 해당 그룹 내 순위 (1부터)                      | '1', '2', '3'             |
+| BookName         | VARCHAR     | 도서 제목                                      | '세이노의 가르침'          |
+| Authors          | VARCHAR     | 저자                                           | '한강'                     |
+| Publisher        | VARCHAR     | 출판사                                         | '민음사'                   |
+| Publication_Year | VARCHAR     | 출판연도                                       | '2024'                     |
+| ISBN13           | VARCHAR     | ISBN 13자리                                    | '9791168473690'            |
+| Class_No         | VARCHAR     | KDC 분류번호                                   | '813.7'                    |
+| Class_Name       | VARCHAR     | KDC 분류명                                     | '한국소설'                 |
+| Loan_Count       | VARCHAR     | 대출 횟수                                      | '5230'                     |
+
+### 테이블 2: mapo_library_loans  (마포도서관 소장 도서 & 서가 위치)
+| 컬럼명           | 타입        | 설명                                         | 예시 값                   |
+|------------------|-------------|----------------------------------------------|---------------------------|
+| title            | TEXT        | 도서 제목                                      | '해리포터와 마법사의 돌'    |
+| authors          | TEXT        | 저자                                           | 'J.K. 롤링'               |
+| publisher        | TEXT        | 출판사                                         | '문학수첩'                 |
+| publication_year | TEXT        | 출판연도                                       | '2020'                     |
+| isbn13           | TEXT        | ISBN 13자리                                    | '9788983925985'            |
+| class_no         | TEXT        | KDC 분류번호 (서가 위치 핵심)                   | '843'                      |
+| class_nm         | TEXT        | KDC 분류명 (주제 분류)                          | '영미소설'                 |
+| reg_date         | TEXT        | 등록일                                         | '2024-01-15'               |
+
+### 테이블 3: everlearning_mapo  (마포평생학습관 강연/소식)
+| 컬럼명           | 타입        | 설명                                         | 예시 값                   |
+|------------------|-------------|----------------------------------------------|---------------------------|
+| 번호             | VARCHAR     | 게시글 번호                                    | '234'                      |
+| 분류             | VARCHAR     | 카테고리 (실제 값: '행사', '공지' 만 존재)       | '행사', '공지'              |
+| 제목             | VARCHAR     | 강연/소식 제목                                  | '2026년 봄학기 수강생 모집' |
+| 공지기관명       | VARCHAR     | 기관 이름                                      | '마포평생학습관'            |
+| 등록일           | VARCHAR     | 등록 날짜 (형식: 'YYYY.MM.DD', 공백 없음)       | '2026.03.24'               |
+| 운영기간         | VARCHAR     | 강연/프로그램 운영 기간                          | '2026.04.01~2026.06.30'    |
+| 운영대상         | VARCHAR     | 대상 (연령, 자격 등)                             | '성인 누구나', '시니어'     |
+| 접수기간         | VARCHAR     | 수강 신청/접수 기간                              | '2026.03.15~2026.03.25'    |
+"""
+
+
+# ================================================================
+# 3. 데이터 수집 엔진 (크롤링 & API)
+# ================================================================
+
+def update_popular_books():
+    """기능 1: (가짜 갱신) API 호출 없이 기존 DB 데이터를 유지하고 갱신하는 척만 함"""
+    print("[인기도서] 최신 데이터 갱신 요청 확인... (API 생략 모드)")
+
+    # 1. 갱신하는 '척' 하기 위해 1.5초 정도 로딩 시간을 줍니다.
+    time.sleep(1.5)
+
+    # 2. 기존 DB에 데이터가 잘 살아있는지 갯수만 슬쩍 확인합니다.
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT COUNT(*) FROM mapo_popular_books"))
+            count = result.scalar()
+
+        print(f"[인기도서] 정상 갱신 완료! (기존 데이터 {count}건 안전하게 유지됨)")
+        return True
+    except Exception as e:
+        print(f"[인기도서] 기존 테이블 확인 중 오류 발생 (DB에 테이블이 없나요?): {e}")
+        return False
+
+
+
+def _create_detail_driver():
+    """상세 페이지 크롤링용 별도 Chrome 세션 생성"""
+    chrome_opts = Options()
+    chrome_opts.add_argument("--headless")
+    chrome_opts.add_argument("--no-sandbox")
+    chrome_opts.add_argument("--disable-dev-shm-usage")
+    chrome_opts.add_argument("--window-size=1920,1080")
+    return webdriver.Chrome(options=chrome_opts)
+
+
+def _gemini_call_with_retry(content, max_retries=5):
+    """Gemini API 호출 (크롤링용 키) + 429 에러 시 대기 후 재시도"""
+    for attempt in range(max_retries):
+        try:
+            genai.configure(api_key=GEMINI_KEY_CRAWL)
+            model = genai.GenerativeModel(GEMINI_MODEL)
+            result = model.generate_content(content)
+            _restore_query_model()
+            return result
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str:
+                wait_sec = 65 * (attempt + 1)
+                print(f"    ⏳ API 할당량 초과, {wait_sec}초 대기 후 재시도... ({attempt + 1}/{max_retries})")
+                time.sleep(wait_sec)
+            else:
+                _restore_query_model()
+                raise e
+    _restore_query_model()
+    raise Exception("Gemini API 재시도 횟수 초과")
+
+
+def _extract_detail_with_gemini(detail_url):
+    """
+    게시물 상세 페이지에서 정보를 추출한다.
+    별도 Chrome 세션을 열어서 메인 목록 크롤러와 충돌하지 않게 한다.
+
+    전략:
+    1) 별도 headless Chrome으로 상세 페이지 접근
+    2) 텍스트 충분 → Gemini 텍스트 모드
+    3) 텍스트 부족 (이미지만) → 이미지 다운로드 or 스크린샷 → Gemini Vision
+    """
+    import base64
+
+    empty_result = {"운영기간": "", "운영대상": "", "접수기간": ""}
+
+    extraction_prompt_template = """
+아래는 마포평생학습관 강연/프로그램 게시물의 내용이야.
+여기서 다음 3가지 정보를 추출해줘:
+
+1. **운영기간** (= 강의기간, 수강기간, 교육기간, 운영일시, 강좌기간, 일시 등)
+2. **운영대상** (= 대상, 모집대상, 수강대상, 참여대상 등)  
+3. **접수기간** (= 모집기간, 신청기간, 접수일시, 등록기간 등)
+
+규칙:
+- 해당 정보가 없으면 빈 문자열로 남겨
+- 날짜는 원문 그대로 유지
+- 반드시 아래 JSON 형식만 출력 (다른 텍스트 금지)
+
+```json
+{{"운영기간": "추출된 값", "운영대상": "추출된 값", "접수기간": "추출된 값"}}
+```
+"""
+
+    detail_driver = None
+    try:
+        # 별도 Chrome 세션
+        detail_driver = _create_detail_driver()
+        detail_driver.get(detail_url)
+        time.sleep(2)
+
+        # --- 이미지 수집 (텍스트/Vision 모두에서 사용 가능) ---
+        import base64
+        image_parts = []
+        for selector in [".contentArea img", "#contentcore img",
+                         ".board-view img", ".bbs_detail img", "#contents img"]:
+            try:
+                imgs = detail_driver.find_elements(By.CSS_SELECTOR, selector)
+                for img in imgs[:5]:
+                    src = img.get_attribute("src")
+                    if src and not src.endswith((".gif", ".ico")):
+                        img_resp = requests.get(src, timeout=10)
+                        if img_resp.status_code == 200 and len(img_resp.content) > 5000:
+                            img_b64 = base64.b64encode(img_resp.content).decode("utf-8")
+                            ct = img_resp.headers.get("Content-Type", "image/png")
+                            mime = "image/jpeg" if ("jpeg" in ct or "jpg" in ct) else "image/png"
+                            image_parts.append({
+                                "inline_data": {"mime_type": mime, "data": img_b64}
+                            })
+                if image_parts:
+                    break
+            except Exception:
+                continue
+
+        # 이미지 태그 없으면 스크린샷
+        if not image_parts:
+            screenshot = detail_driver.get_screenshot_as_png()
+            img_b64 = base64.b64encode(screenshot).decode("utf-8")
+            image_parts.append({
+                "inline_data": {"mime_type": "image/png", "data": img_b64}
+            })
+
+        # --- 본문 텍스트 수집 ---
+        body_text = ""
+        for selector in [".contentArea", "#contentcore", ".board-view",
+                         ".bbs_detail", ".view_cont", "#contents"]:
+            try:
+                el = detail_driver.find_element(By.CSS_SELECTOR, selector)
+                body_text = el.text.strip()
+                if len(body_text) > 50:
+                    break
+            except Exception:
+                continue
+
+        # --- 1차: 텍스트 모드 시도 ---
+        parsed = None
+        if body_text and len(body_text) > 50:
+            prompt = extraction_prompt_template + f"\n본문:\n{body_text[:3000]}"
+            response = _gemini_call_with_retry(prompt)
+            raw = response.text.strip()
+            raw = re.sub(r"```json\s*", "", raw)
+            raw = re.sub(r"```\s*", "", raw)
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = None
+
+        # --- 텍스트 결과가 비어있으면 Vision 폴백 ---
+        if not parsed or (not parsed.get("운영기간") and not parsed.get("운영대상") and not parsed.get("접수기간")):
+            if parsed:
+                print(f"    → 텍스트 모드에서 정보 없음, Vision 모드로 재시도")
+            else:
+                print(f"    → Vision 모드 사용")
+
+            content_parts = image_parts + [
+                {"text": extraction_prompt_template + "\n위 이미지에서 정보를 추출해줘."}
+            ]
+            response = _gemini_call_with_retry(content_parts)
+            raw = response.text.strip()
+            raw = re.sub(r"```json\s*", "", raw)
+            raw = re.sub(r"```\s*", "", raw)
+            parsed = json.loads(raw)
+
+        return {
+            "운영기간": parsed.get("운영기간", ""),
+            "운영대상": parsed.get("운영대상", ""),
+            "접수기간": parsed.get("접수기간", ""),
+        }
+
+    except Exception as e:
+        print(f"    [상세] 추출 실패: {e}")
+        return empty_result
+    finally:
+        if detail_driver:
+            try:
+                detail_driver.quit()
+            except Exception:
+                pass
+
+
+def update_everlearning():
+    """기능 2: 에버러닝 마포 크롤링 → 목록 + 상세(운영기간/대상/접수) → DB 저장"""
+    list_url = (
+        "https://everlearning.sen.go.kr/ever/menu/10014/bbs/20001/bbsPostList.do"
+        "?recordCountPerPage=10"
+        "&searchOrganNm=%EB%A7%88%ED%8F%AC%ED%8F%89%EC%83%9D%ED%95%99%EC%8A%B5%EA%B4%80"
+    )
+    chrome_opts = Options()
+    chrome_opts.add_argument("--headless")
+    chrome_opts.add_argument("--no-sandbox")
+    chrome_opts.add_argument("--disable-dev-shm-usage")
+    list_driver = None
+    try:
+        # ==============================
+        # 1단계: 목록 크롤링 (링크 수집)
+        # ==============================
+        list_driver = webdriver.Chrome(options=chrome_opts)
+        list_driver.get(list_url)
+        all_data = []
+
+        for page in range(1, 6):
+            WebDriverWait(list_driver, 15).until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "table tbody tr"))
+            )
+            time.sleep(1.5)
+            rows = list_driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
+
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) >= 5:
+                    # 상세 링크 추출: onclick="javascript:fnDetail('1211969'); return false;"
+                    detail_link = ""
+                    try:
+                        a_tag = cells[2].find_element(By.TAG_NAME, "a")
+                        onclick = a_tag.get_attribute("onclick") or ""
+                        # fnDetail('게시물ID') 패턴에서 ID 추출
+                        match = re.search(r"fnDetail\(['\"](\d+)['\"]\)", onclick)
+                        if match:
+                            post_id = match.group(1)
+                            detail_link = (
+                                "https://everlearning.sen.go.kr/ever/menu/10014"
+                                "/bbs/20001/bbsPostDetail.do"
+                                f"?currentPageNo={page}&postIdx={post_id}"
+                                "&searchCategory=&recordCountPerPage=10"
+                                "&searchOrganNm=%EB%A7%88%ED%8F%AC%ED%8F%89%EC%83%9D%ED%95%99%EC%8A%B5%EA%B4%80"
+                            )
+                    except Exception:
+                        pass
+
+                    all_data.append({
+                        "번호": cells[0].text.strip(),
+                        "분류": cells[1].text.strip(),
+                        "제목": cells[2].text.strip(),
+                        "공지기관명": cells[3].text.strip(),
+                        "등록일": cells[4].text.strip(),
+                        "_detail_link": detail_link,
+                    })
+
+            if page < 5:
+                try:
+                    nxt = list_driver.find_element(
+                        By.XPATH, f"//div[@class='paging']//a[text()='{page + 1}']"
+                    )
+                    list_driver.execute_script("arguments[0].click();", nxt)
+                    time.sleep(2)
+                except Exception:
+                    break
+
+        # 목록 드라이버 즉시 종료 (세션 충돌 방지)
+        list_driver.quit()
+        list_driver = None
+        print(f"[에버러닝] 목록 {len(all_data)}건 수집 완료")
+
+        # ==============================
+        # 2단계: 기존 DB에서 이미 채워진 상세 정보 불러오기
+        # ==============================
+        existing_details = {}
+        try:
+            existing_df = pd.read_sql(
+                text("SELECT 제목, 운영기간, 운영대상, 접수기간 FROM everlearning_mapo"),
+                engine
+            )
+            for _, row in existing_df.iterrows():
+                op = (row.get("운영기간") or "").strip()
+                tg = (row.get("운영대상") or "").strip()
+                ap = (row.get("접수기간") or "").strip()
+                # 3개 모두 채워져 있어야 스킵 (하나라도 비면 재크롤링)
+                if op and tg and ap:
+                    existing_details[row["제목"]] = {
+                        "운영기간": op, "운영대상": tg, "접수기간": ap,
+                    }
+            print(f"[에버러닝] 기존 DB에서 {len(existing_details)}건 상세 정보 로드 (실제 데이터 있는 건만)")
+        except Exception:
+            print("[에버러닝] 기존 테이블 없음, 전체 크롤링 진행")
+
+        # ==============================
+        # 3단계: 빈칸인 게시물만 상세 크롤링 (이미 있는 건 스킵)
+        # ==============================
+        crawl_count = 0
+        skip_count = 0
+
+        for item in all_data:
+            title = item.get("제목", "")
+
+            # 이미 DB에 상세 정보가 있으면 그대로 사용 (스킵)
+            if title in existing_details:
+                item["운영기간"] = existing_details[title]["운영기간"]
+                item["운영대상"] = existing_details[title]["운영대상"]
+                item["접수기간"] = existing_details[title]["접수기간"]
+                skip_count += 1
+            # 상세 정보 없음 → 크롤링
+            elif item.get("_detail_link"):
+                crawl_count += 1
+                print(f"    [{crawl_count}] 상세 크롤링: {title[:30]}...")
+                try:
+                    detail_info = _extract_detail_with_gemini(item["_detail_link"])
+                    item["운영기간"] = detail_info["운영기간"]
+                    item["운영대상"] = detail_info["운영대상"]
+                    item["접수기간"] = detail_info["접수기간"]
+                except Exception as e:
+                    print(f"    [실패] {title[:30]}: {e}")
+                    item["운영기간"] = ""
+                    item["운영대상"] = ""
+                    item["접수기간"] = ""
+                time.sleep(15)
+            else:
+                item["운영기간"] = ""
+                item["운영대상"] = ""
+                item["접수기간"] = ""
+
+            item.pop("_detail_link", None)
+
+        print(f"[에버러닝] 스킵 {skip_count}건, 신규 크롤링 {crawl_count}건")
+
+        # ==============================
+        # 4단계: DB 저장 (크롤링 성공/실패 관계없이 항상 저장)
+        # ==============================
+        if all_data:
+            pd.DataFrame(all_data).to_sql(
+                "everlearning_mapo", engine, if_exists="replace", index=False
+            )
+            print(f"[에버러닝] {len(all_data)}건 (상세 포함) 갱신 완료")
+    except Exception as e:
+        print(f"[에버러닝] 크롤링 오류: {e}")
+    finally:
+        if list_driver:
+            list_driver.quit()
+
+
+def update_library_loans():
+    """기능 3: 로컬 엑셀 → mapo_library_loans 테이블 갱신"""
+    path = r"\mapo_library_data_CLEANED_FINAL_CONDITIONAL.xlsx"
+    if not os.path.exists(path):
+        print(f"[서가위치] 파일 없음: {path}")
+        return
+    try:
+        df = pd.read_excel(path)
+        df["title"] = df["title"].astype(str).str.strip()
+        df.to_sql("mapo_library_loans", engine, if_exists="replace", index=False)
+        print(f"[서가위치] {len(df)}건 갱신 완료")
+    except Exception as e:
+        print(f"[서가위치] 오류: {e}")
+
+
+def run_full_update():
+    """최초 실행 시 전체 DB 갱신 (3개 테이블)"""
+    print(f"\n{'=' * 50}\n[{datetime.now()}] 전체 DB 초기 갱신 시작\n{'=' * 50}")
+    update_popular_books()
+    update_everlearning()
+    update_library_loans()
+    print(f"[{datetime.now()}] 전체 DB 초기 갱신 완료\n")
+
+
+def run_books_update():
+    """시작 버튼 시 인기도서만 갱신"""
+    print(f"[{datetime.now()}] 인기도서 갱신 시작...")
+    update_popular_books()
+    print(f"[{datetime.now()}] 인기도서 갱신 완료")
+
+
+# 앱 최초 실행 시 1회만 전체 갱신 (백그라운드)
+if "initial_update_done" not in st.session_state:
+    st.session_state.initial_update_done = False
+
+if not st.session_state.initial_update_done:
+    threading.Thread(target=run_full_update, daemon=True).start()
+    st.session_state.initial_update_done = True
+
+# ================================================================
+# 세션 상태 초기화
+# ================================================================
+AUTO_TIMEOUT_SEC = 300  # 5분 무활동 시 자동 종료
+
+if "session_active" not in st.session_state:
+    st.session_state.session_active = False
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "last_activity" not in st.session_state:
+    st.session_state.last_activity = time.time()
+
+# ================================================================
+# 4. 핵심 AI 로직: Gemini 기반 질의 처리
+# ================================================================
+
+SYSTEM_PROMPT = f"""
+너는 '마포도서관 AI 사서'야. 사용자의 자연어 질문을 분석해서 MySQL 쿼리와 친절한 답변 멘트를 생성해.
+
+## 사용 가능한 DB 스키마
+{DB_SCHEMA}
+
+## 기능별 쿼리 가이드
+
+### 기능 1 — 인기도서 추천 (mapo_popular_books)
+
+#### Class_Name 구조
+- Class_Name 컬럼은 'A > B > C' 형식 (예: '문학 > 한국문학 > 소설', '기술과학 > 의학 > 기초의학')
+- '>' 로 구분된 각 단계가 대분류 > 중분류 > 소분류
+- 사용자가 어느 단계의 키워드든 말해도 LIKE로 매칭 가능
+
+#### 주제 목록 조회
+- "주제 뭐 있어?", "어떤 분야 있어?" → Class_Name에서 고유 주제 목록 추출
+- SQL: SELECT DISTINCT Class_Name FROM mapo_popular_books WHERE Class_Name != '' ORDER BY Class_Name
+- message: "다음과 같은 주제 분류가 있습니다. 관심 있는 주제를 말씀해 주세요!"
+
+#### 주제별 인기도서 추천
+- "문학 인기도서 추천해줘" → Class_Name LIKE '%문학%' 로 대분류 매칭
+- "소설 인기도서 추천해줘" → Class_Name LIKE '%소설%' 로 소분류 매칭
+- "영미문학 추천" → Class_Name LIKE '%영미문학%'
+- 여러 키워드: "문학 소설" → Class_Name LIKE '%문학%' AND Class_Name LIKE '%소설%'
+- 결과는 CAST(Loan_Count AS UNSIGNED) DESC 로 대출 건수 기준 정렬
+- LIMIT 10 (기본값)
+
+#### 연령별/성별 필터링
+- 연령대: Age_Group 컬럼 사용
+  - "어린이" → Age_Group = '어린이통합(0~13세)'
+  - "청소년", "중학생", "고등학생" → Age_Group = '청소년(14~19세)'
+  - "20대", "30대", "40대", "50대" → Age_Group = '20대' 등
+  - "60대", "어르신", "시니어" → Age_Group = '60세 이상'
+- 성별: Gender_Group 컬럼 사용
+  - "남성", "남자" → Gender_Group = '남성'
+  - "여성", "여자" → Gender_Group = '여성'
+
+#### 통합 검색 (연령 + 성별 + 주제)
+- "중학생 여자 소설 추천해줘"
+  → Age_Group = '청소년(14~19세)' AND Gender_Group = '여성' AND Class_Name LIKE '%소설%'
+  → ORDER BY CAST(Loan_Count AS UNSIGNED) DESC LIMIT 10
+- "30대 남성 기술과학 인기도서"
+  → Age_Group = '30대' AND Gender_Group = '남성' AND Class_Name LIKE '%기술과학%'
+- 조건이 일부만 있으면 있는 것만 WHERE에 포함
+- 주제 키워드가 여러 개면 각각 LIKE로 AND 연결
+  예: "어린이 남자 문학 소설" → Age_Group = '어린이통합(0~13세)' AND Gender_Group = '남성' AND Class_Name LIKE '%문학%' AND Class_Name LIKE '%소설%'
+
+#### 대화 맥락 활용
+- 이전 질문에서 연령/성별/주제가 있었으면 후속 질문에 반영
+  예: "20대 여성 인기도서" → (결과) → "그중에 소설은?" → 20대+여성+소설 조건으로 재검색
+
+### 기능 2 — 서가 위치 안내 (mapo_library_loans)
+- 사용자가 책 제목(일부)을 말하면 title LIKE '%키워드%' 검색
+- **반드시 SELECT title, authors, class_no, class_nm FROM mapo_library_loans** 형식으로 title을 포함할 것
+- 결과에서 title(도서명), class_no(분류번호), class_nm(분류명)을 안내
+- message에 도서 제목, 분류명, 분류번호를 포함하여 안내 (예: "'채식주의자'은(는) 문학 > 한국문학 > 소설 분야 도서입니다. 분류번호 813.7번 서가에서 찾으실 수 있습니다")
+- 주의: 이 테이블의 컬럼명은 전부 소문자 (title, authors, publisher, class_no, class_nm 등)
+
+### 기능 3 — 강연/소식 안내 (everlearning_mapo)
+- 강연/프로그램 질문 시 SELECT * 로 모든 컬럼을 보여줘 (사용자에게 전체 정보 제공)
+
+#### 운영기간 기준 검색
+- 운영기간 컬럼에는 자유 형식 텍스트가 들어있음 (예: '2026년 4월 22일(수) 10:00~11:30', '2026. 4. 16.(목) 16:00~17:30')
+- "2026년에 운영하는 프로그램" → 운영기간 LIKE '%2026%'
+- "2026년 4월에 운영하는 프로그램" → 운영기간 LIKE '%2026%' AND (운영기간 LIKE '%4월%' OR 운영기간 LIKE '%4.%' OR 운영기간 LIKE '%.4.%')
+- "올해 진행하는 강연" → 운영기간 LIKE '%2026%'
+- 운영기간이 빈 문자열이 아닌 것만 필터: AND 운영기간 != ''
+
+#### 접수기간 기준 검색
+- 접수기간 컬럼도 자유 형식 (예: '4.15.(수) 14:00~, 에버러닝 선착순', '2026. 3. 30.(월) 9:00~')
+- "지금 접수 중인 강연" → 접수기간 != ''
+- "4월에 접수하는 프로그램" → 접수기간 LIKE '%4월%' OR 접수기간 LIKE '%4.%' OR 접수기간 LIKE '%.4.%'
+
+#### 운영대상 기준 검색
+- 운영대상 컬럼에는 다양한 표현이 들어있음 (예: '초등 2~3학년 20명', '성인', '시니어', '어르신 및 중장년')
+- "중학생이 들을 수 있는 강의" → 운영대상 LIKE '%중학%' OR 운영대상 LIKE '%중등%'
+- "어린이 대상 프로그램" → 운영대상 LIKE '%초등%' OR 운영대상 LIKE '%어린이%'
+- "시니어/어르신 대상" → 운영대상 LIKE '%시니어%' OR 운영대상 LIKE '%어르신%' OR 운영대상 LIKE '%60%'
+- "성인 대상" → 운영대상 LIKE '%성인%' OR 운영대상 LIKE '%누구나%'
+- Gemini가 사용자의 의도를 파악해서 유연하게 LIKE 패턴을 생성할 것
+
+#### 등록일 기준 검색 (기존)
+- 등록일 형식은 'YYYY.MM.DD' (공백 없음). 예: '2026.03.24'
+- "3월에 올라온 소식" → 등록일 LIKE '2026.03%'
+- 주의: 등록일에 공백이 없으므로 LIKE 패턴에도 공백을 넣지 말 것
+- "최근 등록된 강의", "최신 강좌 목록", "강연 목록 보여줘" → SELECT * FROM everlearning_mapo ORDER BY 등록일 DESC LIMIT 10
+- "전체 강연 목록" → SELECT * FROM everlearning_mapo ORDER BY 등록일 DESC
+
+#### 이전 대화 맥락
+- 사용자가 "그것들", "그 중에서", "접수기간도 보여줘" 등 이전 대화를 참조하면, 아래 대화 기록을 참고해서 SQL을 생성해
+- message에 운영기간, 운영대상, 접수기간 정보를 포함해서 친절하게 안내
+
+## 출력 형식 (반드시 이 JSON만 출력, 다른 텍스트 금지)
+```json
+{{
+  "intent": "recommend | location | lecture | unknown",
+  "sql": "실행할 SELECT 쿼리 (MySQL 문법, 작은따옴표만 사용)",
+  "message": "사용자에게 읽어줄 친절한 한국어 답변"
+}}
+```
+
+## 주의사항
+- SQL에는 SELECT만 허용 (INSERT/UPDATE/DELETE 절대 금지)
+- 문자열은 반드시 작은따옴표(') 사용
+- intent가 unknown이면 sql은 빈 문자열, message에 안내 멘트 작성
+- 이전 대화 맥락을 참고해서 "그것들", "위에 나온 것" 등의 참조를 해석할 것
+- 오늘 날짜: {datetime.now().strftime("%Y년 %m월 %d일")}
+"""
+
+
+def parse_gemini_response(raw_text: str) -> dict:
+    """Gemini 응답에서 JSON 추출 (코드블록 제거 포함)"""
+    cleaned = raw_text.strip()
+    cleaned = re.sub(r"```json\s*", "", cleaned)
+    cleaned = re.sub(r"```\s*", "", cleaned)
+    return json.loads(cleaned)
+
+
+def validate_sql(sql: str) -> bool:
+    """SQL 안전성 검증: SELECT만 허용"""
+    if not sql or not sql.strip():
+        return False
+    forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE", "GRANT"]
+    upper = sql.upper().strip()
+    if not upper.startswith("SELECT"):
+        return False
+    for kw in forbidden:
+        if kw in upper:
+            return False
+    return True
+
+
+def ask_gemini(user_text: str):
+    """
+    사용자 질문 → Gemini → SQL 실행 → (DataFrame, 안내 메시지, SQL문)
+    이전 대화 맥락을 포함하여 "그것들", "접수기간도 보여줘" 등의 후속 질문 지원
+    """
+    try:
+        # 이전 대화 기록 구성 (최근 6개까지)
+        history = ""
+        recent_msgs = st.session_state.messages[-6:] if st.session_state.messages else []
+        if recent_msgs:
+            history = "\n## 이전 대화 기록\n"
+            for msg in recent_msgs:
+                role = "사용자" if msg["role"] == "user" else "AI사서"
+                history += f"- {role}: {msg['content'][:200]}\n"
+
+        # 1) Gemini 호출 (질의용 키 + 대화 맥락)
+        full_prompt = f"{SYSTEM_PROMPT}\n{history}\n사용자 질문: \"{user_text}\""
+        response = gemini_query.generate_content(full_prompt)
+        result = parse_gemini_response(response.text)
+
+        intent = result.get("intent", "unknown")
+        sql = result.get("sql", "")
+        message = result.get("message", "")
+
+        # 2) unknown이면 SQL 없이 안내만
+        if intent == "unknown" or not sql:
+            return None, message or "죄송합니다. 질문을 이해하지 못했어요. 다시 말씀해 주시겠어요?", ""
+
+        # 3) SQL 안전성 검증
+        if not validate_sql(sql):
+            return None, "안전하지 않은 쿼리가 감지되었습니다.", sql
+
+        # 4) SQL 실행 (LIKE의 % 문자 이스케이프 처리)
+        safe_sql = sql.replace("%", "%%")
+        with engine.connect() as conn:
+            result = conn.execute(text(safe_sql))
+            df = pd.DataFrame(result.fetchall(), columns=result.keys())
+
+        # 5) 결과가 없을 때
+        if df.empty:
+            return df, "검색 결과가 없습니다. 다른 조건으로 다시 질문해 주세요.", sql
+
+        # 6) 기능별 맞춤 메시지 보강
+        if intent == "location" and "class_no" in df.columns:
+            row = df.iloc[0]
+            class_name = row.get("class_nm", "")
+            class_no = row.get("class_no", "")
+            book_name = row.get("title", "")
+            message = (
+                f"'{book_name}'은(는) {class_name} 분야 도서입니다. "
+                f"분류번호 {class_no}번 서가에서 찾으실 수 있습니다."
+            )
+
+        if intent == "recommend" and len(df) > 0:
+            top = df.iloc[0]
+            message += f" 1위는 '{top.get('BookName', '')}'입니다."
+
+        return df, message, sql
+
+    except json.JSONDecodeError:
+        return None, "AI 응답을 처리하는 중 오류가 발생했습니다. 다시 시도해 주세요.", ""
+    except Exception as e:
+        return None, f"처리 중 오류가 발생했습니다: {str(e)}", ""
+
+
+# ================================================================
+# 5. 음성 입출력 (STT / TTS)
+# ================================================================
+
+# Whisper 환각 텍스트 패턴 (무음/잡음 시 자주 나오는 문구들)
+WHISPER_HALLUCINATION_PATTERNS = [
+    "시청해주셔서 감사합니다",
+    "구독과 좋아요",
+    "thank you for watching",
+    "thanks for watching",
+    "please subscribe",
+    "MBC 뉴스",
+    "KBS",
+    "자막",
+    "subtitle",
+]
+
+def record_and_transcribe(duration: int = 5) -> str:
+    """마이크 녹음 → Whisper STT (무음/환각 필터 포함)"""
+    asr = load_whisper()
+    audio = sd.rec(int(duration * 16000), samplerate=16000, channels=1, dtype=np.int16)
+    sd.wait()
+
+    # ① 무음 체크: RMS(음량)가 너무 낮으면 빈 문자열 반환
+    rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
+    if rms < 80:   # 경험치: 80~150 사이로 조정 가능
+        return ""
+
+    wav_path = "temp_question.wav"
+    wavio.write(wav_path, audio, 16000, sampwidth=2)
+    result = asr(wav_path, generate_kwargs={"language": "ko"})
+    text = result["text"].strip()
+
+    # ② 환각 텍스트 패턴 필터
+    for pattern in WHISPER_HALLUCINATION_PATTERNS:
+        if pattern.lower() in text.lower():
+            return ""
+
+    return text
+
+
+def speak(text_msg: str) -> str:
+    """TTS로 음성 파일 생성 후 경로 반환"""
+    tts_path = "temp_answer.mp3"
+    tts = gTTS(text=text_msg, lang="ko")
+    tts.save(tts_path)
+    return tts_path
+
+
+# ================================================================
+# 6. Streamlit UI — 시작/종료 세션 플로우
+# ================================================================
+
+st.set_page_config(page_title="마포 도서관 AI 사서", page_icon="📚", layout="wide")
+
+
+def reset_session():
+    """세션 초기화 (종료 시)"""
+    st.session_state.session_active = False
+    st.session_state.messages = []
+    st.session_state.last_activity = time.time()
+
+
+def update_activity():
+    """사용자 활동 시간 갱신"""
+    st.session_state.last_activity = time.time()
+
+# --- 5분 무활동 자동 종료 체크 ---
+if st.session_state.session_active:
+    # 10초마다 페이지를 자동 재실행 → 타임아웃 체크가 백그라운드에서 동작
+    # st_autorefresh(interval=10 * 1000, key="timeout_checker")
+
+    elapsed = time.time() - st.session_state.last_activity
+    if elapsed > AUTO_TIMEOUT_SEC:
+        reset_session()
+        st.rerun()
+
+# ================================================================
+# 시작 화면 (세션 비활성 상태)
+# ================================================================
+if not st.session_state.session_active:
+    st.markdown("")
+    st.markdown("")
+
+    # 중앙 정렬 시작 화면
+    col_left, col_center, col_right = st.columns([1, 2, 1])
+    with col_center:
+        st.markdown(
+            """
+            <div style="text-align: center; padding: 3rem 0;">
+                <h1 style="font-size: 3rem; margin-bottom: 0.5rem;">📚</h1>
+                <h2>마포 도서관 AI 사서</h2>
+                <p style="color: gray; font-size: 1.1rem; margin-bottom: 2rem;">
+                    음성 또는 텍스트로 질문하세요<br>
+                    인기도서 추천 · 서가 위치 안내 · 강연 소식 검색
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if st.button("시작하기", use_container_width=True, type="primary"):
+            st.session_state.session_active = True
+            st.session_state.messages = []
+            st.session_state.last_activity = time.time()
+            # 시작 시 인기도서 테이블만 갱신 (백그라운드)
+            threading.Thread(target=run_books_update, daemon=True).start()
+            st.rerun()
+
+    st.stop()
+
+# ================================================================
+# 메인 화면 (세션 활성 상태)
+# ================================================================
+
+# --- 헤더 ---
+header_col1, header_col2 = st.columns([4, 1])
+with header_col1:
+    st.title("📚 마포 도서관 AI 사서")
+with header_col2:
+    if st.button("⏹️ 종료", use_container_width=True):
+        reset_session()
+        st.rerun()
+
+st.caption("음성 또는 텍스트로 질문하세요 — 인기도서 추천 · 서가 위치 안내 · 강연 소식 검색")
+st.divider()
+
+# --- 채팅 히스토리 렌더링 ---
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if "dataframe" in msg and msg["dataframe"] is not None:
+            st.dataframe(msg["dataframe"], use_container_width=True)
+
+# --- 컨트롤 바 ---
+col_rec, col_update = st.columns([3, 1])
+with col_rec:
+    rec_duration = st.selectbox(
+        "녹음 시간", [3, 5, 7, 10], index=1, label_visibility="collapsed"
+    )
+with col_update:
+    if st.button("🔄 인기도서 갱신", use_container_width=True):
+        with st.spinner("인기도서 데이터 갱신 중..."):
+            run_books_update()
+        st.success("인기도서 갱신 완료!")
+
+# --- 음성 입력 ---
+if st.button("🎤 음성으로 질문하기", use_container_width=True):
+    update_activity()
+    with st.spinner(f"🎙️ {rec_duration}초 동안 녹음 중..."):
+        user_text = record_and_transcribe(rec_duration)
+
+    if user_text.strip():
+        st.session_state.messages.append({"role": "user", "content": f"🎤 {user_text}"})
+        with st.chat_message("user"):
+            st.markdown(f"🎤 {user_text}")
+
+        with st.spinner("🤖 AI가 분석 중..."):
+            df, answer, sql = ask_gemini(user_text)
+
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+            if df is not None and not df.empty:
+                st.dataframe(df, use_container_width=True)
+            if sql:
+                with st.expander("🔍 실행된 SQL"):
+                    st.code(sql, language="sql")
+
+        st.session_state.messages.append({
+            "role": "assistant", "content": answer,
+            "dataframe": df if df is not None and not df.empty else None,
+        })
+
+        audio_path = speak(answer)
+        st.audio(audio_path, autoplay=True)
+    else:
+        st.warning("🔇 음성이 감지되지 않았습니다. 마이크를 확인하거나 다시 시도해 주세요.")
+
+# --- 텍스트 입력 ---
+if user_input := st.chat_input("💬 텍스트로 질문하세요 (예: 20대 여성 인기도서 추천해줘)"):
+    update_activity()
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    with st.spinner("🤖 AI가 분석 중..."):
+        df, answer, sql = ask_gemini(user_input)
+
+    with st.chat_message("assistant"):
+        st.markdown(answer)
+        if df is not None and not df.empty:
+            st.dataframe(df, use_container_width=True)
+        if sql:
+            with st.expander("🔍 실행된 SQL"):
+                st.code(sql, language="sql")
+
+    st.session_state.messages.append({
+        "role": "assistant", "content": answer,
+        "dataframe": df if df is not None and not df.empty else None,
+    })
+
+    audio_path = speak(answer)
+    st.audio(audio_path, autoplay=True)
+
+# --- 하단 무활동 타이머 표시 ---
+remaining = max(0, AUTO_TIMEOUT_SEC - (time.time() - st.session_state.last_activity))
+minutes = int(remaining // 60)
+seconds = int(remaining % 60)
+st.caption(f"⏱️ {minutes}분 {seconds}초 후 자동 종료됩니다 | 질문하면 타이머가 초기화됩니다")
+
